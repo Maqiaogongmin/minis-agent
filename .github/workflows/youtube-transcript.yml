@@ -14,79 +14,90 @@ on:
 jobs:
   fetch-transcript:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install yt-dlp
-        run: pip install yt-dlp
+      - name: Install dependencies
+        run: pip install youtube-transcript-api
 
       - name: Write fetch script
         run: |
           cat > fetch.py << 'ENDOFSCRIPT'
-          import yt_dlp, json, os, sys, urllib.request
+import sys, os, re
 
-          video = os.environ['VIDEO_URL']
-          lang  = os.environ.get('LANG_CODE', 'zh-Hans')
+video_input = os.environ['VIDEO_URL']
+lang = os.environ.get('LANG_CODE', 'zh-Hans')
 
-          ydl_opts = {'skip_download': True, 'quiet': True}
-          with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-              info = ydl.extract_info(video, download=False)
+# 提取 video ID
+match = re.search(r'(?:v=|youtu\.be/|/embed/|/shorts/)([A-Za-z0-9_-]{11})', video_input)
+video_id = match.group(1) if match else video_input.strip()
+print(f"Video ID: {video_id}")
 
-          title    = info.get('title', 'Unknown')
-          channel  = info.get('channel', '')
-          duration = int(info.get('duration', 0))
-          vid_id   = info.get('id', 'video')
+from youtube_transcript_api import YouTubeTranscriptApi
+api = YouTubeTranscriptApi()
 
-          print(f"Title: {title}")
-          print(f"Channel: {channel}")
+# 列出可用字幕
+transcript_list = api.list(video_id)
+available = [(t.language_code, t.language, t.is_generated) for t in transcript_list]
+print(f"可用字幕: {available}")
 
-          subs      = info.get('subtitles', {})
-          auto_subs = info.get('automatic_captions', {})
+# 按优先级选语言
+fetched = None
+for try_lang in [lang, 'zh-Hans', 'zh', 'en']:
+    try:
+        fetched = api.fetch(video_id, languages=[try_lang])
+        print(f"使用语言: {try_lang}")
+        break
+    except Exception as e:
+        print(f"  {try_lang} 失败: {e}")
 
-          sub_url   = None
-          lang_used = None
-          for l in [lang, 'zh-Hans', 'zh', 'en']:
-              tracks = subs.get(l) or auto_subs.get(l)
-              if tracks:
-                  for t in tracks:
-                      if t.get('ext') == 'json3':
-                          sub_url   = t['url']
-                          lang_used = l
-                          break
-                  if sub_url:
-                      break
+if not fetched:
+    print("ERROR: 无法获取任何字幕")
+    sys.exit(1)
 
-          if not sub_url:
-              print("ERROR: No subtitles found")
-              sys.exit(1)
+# 格式化输出
+snippets = list(fetched)
+lines = []
+for s in snippets:
+    ms = int(float(s.start) * 1000)
+    h = ms // 3600000
+    m = (ms % 3600000) // 60000
+    sec = (ms % 60000) // 1000
+    ts = f"[{h:02d}:{m:02d}:{sec:02d}]"
+    text = s.text.strip()
+    if text:
+        lines.append(f"{ts} {text}")
 
-          print(f"Subtitle lang: {lang_used}")
-          with urllib.request.urlopen(sub_url, timeout=30) as r:
-              sub_data = json.loads(r.read())
+# 获取视频标题（简单方式）
+title = video_id
+channel = ""
+try:
+    import urllib.request
+    req = urllib.request.Request(
+        f"https://www.youtube.com/oembed?url=https://youtu.be/{video_id}&format=json",
+        headers={"User-Agent": "Mozilla/5.0"}
+    )
+    import json
+    with urllib.request.urlopen(req, timeout=10) as r:
+        meta = json.loads(r.read())
+        title = meta.get('title', video_id)
+        channel = meta.get('author_name', '')
+except Exception as e:
+    print(f"标题获取失败（不影响字幕）: {e}")
 
-          events = sub_data.get('events', [])
-          lines  = []
-          for ev in events:
-              segs = ev.get('segs', [])
-              text = ''.join(s.get('utf8', '') for s in segs).strip()
-              if text and text != '\n':
-                  ms = ev.get('tStartMs', 0)
-                  ts = f"[{ms//3600000:02d}:{(ms%3600000)//60000:02d}:{(ms%60000)//1000:02d}]"
-                  lines.append(f"{ts} {text}")
+os.makedirs('output', exist_ok=True)
+out = f"output/{video_id}.md"
+with open(out, 'w') as f:
+    f.write(f"# {title}\n\n")
+    f.write(f"**频道**：{channel}  \n")
+    f.write(f"**链接**：https://youtu.be/{video_id}\n\n---\n\n")
+    f.write('\n'.join(lines))
 
-          os.makedirs('output', exist_ok=True)
-          out = f"output/{vid_id}.md"
-          with open(out, 'w') as f:
-              f.write(f"# {title}\n\n")
-              f.write(f"**频道**：{channel}  \n")
-              f.write(f"**时长**：{duration//60}分{duration%60}秒  \n")
-              f.write(f"**语言**：{lang_used}  \n")
-              f.write(f"**链接**：https://youtu.be/{vid_id}\n\n---\n\n")
-              f.write('\n'.join(lines))
-
-          print(f"Saved: {out} ({len(lines)} segments)")
-          ENDOFSCRIPT
+print(f"✅ 已保存: {out}，共 {len(lines)} 段")
+ENDOFSCRIPT
 
       - name: Fetch transcript
         env:
@@ -94,13 +105,13 @@ jobs:
           LANG_CODE: ${{ github.event.inputs.language }}
         run: python3 fetch.py
 
-      - name: Upload result
+      - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: transcript
           path: output/
 
-      - name: Commit result to repo
+      - name: Commit result
         run: |
           git config user.name "minis-agent"
           git config user.email "minis@agent.local"
