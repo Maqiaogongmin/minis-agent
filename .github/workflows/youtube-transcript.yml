@@ -21,34 +21,30 @@ jobs:
       - name: Install yt-dlp
         run: pip install yt-dlp
 
-      - name: Fetch transcript
+      - name: Write fetch script
         run: |
-          mkdir -p output
-          VIDEO="${{ github.event.inputs.video_url }}"
-          LANG="${{ github.event.inputs.language }}"
+          cat > fetch.py << 'ENDOFSCRIPT'
+          import yt_dlp, json, os, sys, urllib.request
 
-          python3 << 'PYEOF'
-          import yt_dlp, json, os, re, sys
-
-          video = os.environ.get('VIDEO_URL', '')
+          video = os.environ['VIDEO_URL']
           lang  = os.environ.get('LANG_CODE', 'zh-Hans')
 
-          ydl_opts = {
-              'skip_download': True,
-              'quiet': True,
-          }
-
+          ydl_opts = {'skip_download': True, 'quiet': True}
           with yt_dlp.YoutubeDL(ydl_opts) as ydl:
               info = ydl.extract_info(video, download=False)
 
           title    = info.get('title', 'Unknown')
           channel  = info.get('channel', '')
           duration = int(info.get('duration', 0))
+          vid_id   = info.get('id', 'video')
+
+          print(f"Title: {title}")
+          print(f"Channel: {channel}")
 
           subs      = info.get('subtitles', {})
           auto_subs = info.get('automatic_captions', {})
 
-          sub_url  = None
+          sub_url   = None
           lang_used = None
           for l in [lang, 'zh-Hans', 'zh', 'en']:
               tracks = subs.get(l) or auto_subs.get(l)
@@ -65,7 +61,7 @@ jobs:
               print("ERROR: No subtitles found")
               sys.exit(1)
 
-          import urllib.request
+          print(f"Subtitle lang: {lang_used}")
           with urllib.request.urlopen(sub_url, timeout=30) as r:
               sub_data = json.loads(r.read())
 
@@ -79,8 +75,8 @@ jobs:
                   ts = f"[{ms//3600000:02d}:{(ms%3600000)//60000:02d}:{(ms%60000)//1000:02d}]"
                   lines.append(f"{ts} {text}")
 
-          vid_id = info.get('id', 'video')
-          out    = f"output/{vid_id}.md"
+          os.makedirs('output', exist_ok=True)
+          out = f"output/{vid_id}.md"
           with open(out, 'w') as f:
               f.write(f"# {title}\n\n")
               f.write(f"**频道**：{channel}  \n")
@@ -89,11 +85,14 @@ jobs:
               f.write(f"**链接**：https://youtu.be/{vid_id}\n\n---\n\n")
               f.write('\n'.join(lines))
 
-          print(f"✅ Saved: {out} ({len(lines)} segments)")
-          PYEOF
+          print(f"Saved: {out} ({len(lines)} segments)")
+          ENDOFSCRIPT
+
+      - name: Fetch transcript
         env:
           VIDEO_URL: ${{ github.event.inputs.video_url }}
           LANG_CODE: ${{ github.event.inputs.language }}
+        run: python3 fetch.py
 
       - name: Upload result
         uses: actions/upload-artifact@v4
