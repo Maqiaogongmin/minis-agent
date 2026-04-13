@@ -22,6 +22,10 @@ jobs:
       - name: Install
         run: pip install youtube-transcript-api
 
+      - name: Write cookies
+        run: |
+          echo "${{ secrets.YOUTUBE_COOKIES }}" > /tmp/cookies.txt
+
       - name: Run
         env:
           VIDEO_URL: ${{ github.event.inputs.video_url }}
@@ -30,6 +34,7 @@ jobs:
           python3 - << 'EOF'
           import sys, os, re, json, urllib.request
           from youtube_transcript_api import YouTubeTranscriptApi
+          from youtube_transcript_api.proxies import GenericProxyConfig
 
           video_input = os.environ['VIDEO_URL']
           lang = os.environ.get('LANG_CODE', 'zh-Hans')
@@ -38,12 +43,36 @@ jobs:
           video_id = match.group(1) if match else video_input.strip()
           print(f"Video ID: {video_id}")
 
-          api = YouTubeTranscriptApi()
+          # 读取 cookies
+          cookie_header = {}
+          try:
+              cookies = {}
+              with open('/tmp/cookies.txt') as f:
+                  for line in f:
+                      line = line.strip()
+                      if line and not line.startswith('#'):
+                          parts = line.split('\t')
+                          if len(parts) >= 7:
+                              cookies[parts[5]] = parts[6]
+              cookie_str = '; '.join(f'{k}={v}' for k,v in cookies.items())
+              cookie_header = {'Cookie': cookie_str}
+              print(f"已加载 {len(cookies)} 个 cookies")
+          except Exception as e:
+              print(f"Cookie 加载失败: {e}")
+
+          import requests
+          session = requests.Session()
+          session.headers.update({
+              'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15',
+              **cookie_header
+          })
+
+          api = YouTubeTranscriptApi(http_client=session)
           fetched = None
           for try_lang in [lang, 'zh-Hans', 'zh', 'en']:
               try:
                   fetched = api.fetch(video_id, languages=[try_lang])
-                  print(f"Lang: {try_lang}")
+                  print(f"成功获取语言: {try_lang}")
                   break
               except Exception as e:
                   print(f"  {try_lang}: {e}")
@@ -75,7 +104,7 @@ jobs:
               f.write(f"# {title}\n\n**频道**：{channel}  \n**链接**：https://youtu.be/{video_id}\n\n---\n\n")
               f.write('\n'.join(lines))
 
-          print(f"Saved {out} ({len(lines)} segs)")
+          print(f"✅ Saved {out} ({len(lines)} segs)")
           EOF
 
       - uses: actions/upload-artifact@v4
@@ -88,4 +117,4 @@ jobs:
           git config user.name "minis-agent"
           git config user.email "minis@agent.local"
           git add output/
-          git diff --cached --quiet || git commit -m "transcript: ${{ github.event.inputs.video_url }}" && git push
+          git diff --cached --quiet || (git commit -m "transcript: ${{ github.event.inputs.video_url }}" && git push)
