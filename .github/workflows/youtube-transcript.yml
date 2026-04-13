@@ -1,0 +1,110 @@
+name: YouTube Transcript
+
+on:
+  workflow_dispatch:
+    inputs:
+      video_url:
+        description: 'YouTube URL or video ID'
+        required: true
+      language:
+        description: 'Subtitle language (e.g. zh-Hans, en)'
+        required: false
+        default: 'zh-Hans'
+
+jobs:
+  fetch-transcript:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install yt-dlp
+        run: pip install yt-dlp
+
+      - name: Fetch transcript
+        run: |
+          mkdir -p output
+          VIDEO="${{ github.event.inputs.video_url }}"
+          LANG="${{ github.event.inputs.language }}"
+
+          python3 << 'PYEOF'
+          import yt_dlp, json, os, re, sys
+
+          video = os.environ.get('VIDEO_URL', '')
+          lang  = os.environ.get('LANG_CODE', 'zh-Hans')
+
+          ydl_opts = {
+              'skip_download': True,
+              'quiet': True,
+          }
+
+          with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+              info = ydl.extract_info(video, download=False)
+
+          title    = info.get('title', 'Unknown')
+          channel  = info.get('channel', '')
+          duration = int(info.get('duration', 0))
+
+          subs      = info.get('subtitles', {})
+          auto_subs = info.get('automatic_captions', {})
+
+          sub_url  = None
+          lang_used = None
+          for l in [lang, 'zh-Hans', 'zh', 'en']:
+              tracks = subs.get(l) or auto_subs.get(l)
+              if tracks:
+                  for t in tracks:
+                      if t.get('ext') == 'json3':
+                          sub_url   = t['url']
+                          lang_used = l
+                          break
+                  if sub_url:
+                      break
+
+          if not sub_url:
+              print("ERROR: No subtitles found")
+              sys.exit(1)
+
+          import urllib.request
+          with urllib.request.urlopen(sub_url, timeout=30) as r:
+              sub_data = json.loads(r.read())
+
+          events = sub_data.get('events', [])
+          lines  = []
+          for ev in events:
+              segs = ev.get('segs', [])
+              text = ''.join(s.get('utf8', '') for s in segs).strip()
+              if text and text != '\n':
+                  ms = ev.get('tStartMs', 0)
+                  ts = f"[{ms//3600000:02d}:{(ms%3600000)//60000:02d}:{(ms%60000)//1000:02d}]"
+                  lines.append(f"{ts} {text}")
+
+          vid_id = info.get('id', 'video')
+          out    = f"output/{vid_id}.md"
+          with open(out, 'w') as f:
+              f.write(f"# {title}\n\n")
+              f.write(f"**频道**：{channel}  \n")
+              f.write(f"**时长**：{duration//60}分{duration%60}秒  \n")
+              f.write(f"**语言**：{lang_used}  \n")
+              f.write(f"**链接**：https://youtu.be/{vid_id}\n\n---\n\n")
+              f.write('\n'.join(lines))
+
+          print(f"✅ Saved: {out} ({len(lines)} segments)")
+          PYEOF
+        env:
+          VIDEO_URL: ${{ github.event.inputs.video_url }}
+          LANG_CODE: ${{ github.event.inputs.language }}
+
+      - name: Upload result
+        uses: actions/upload-artifact@v4
+        with:
+          name: transcript
+          path: output/
+
+      - name: Commit result to repo
+        run: |
+          git config user.name "minis-agent"
+          git config user.email "minis@agent.local"
+          git add output/
+          git diff --cached --quiet || git commit -m "transcript: ${{ github.event.inputs.video_url }}"
+          git push
