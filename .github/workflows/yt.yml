@@ -20,11 +20,12 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install
-        run: pip install youtube-transcript-api
+        run: pip install youtube-transcript-api yt-dlp
 
       - name: Write cookies
-        run: |
-          echo "${{ secrets.YOUTUBE_COOKIES }}" > /tmp/cookies.txt
+        env:
+          YOUTUBE_COOKIES: ${{ secrets.YOUTUBE_COOKIES }}
+        run: echo "$YOUTUBE_COOKIES" > /tmp/cookies.txt && wc -l /tmp/cookies.txt
 
       - name: Run
         env:
@@ -32,9 +33,7 @@ jobs:
           LANG_CODE: ${{ github.event.inputs.language }}
         run: |
           python3 - << 'EOF'
-          import sys, os, re, json, urllib.request
-          from youtube_transcript_api import YouTubeTranscriptApi
-          from youtube_transcript_api.proxies import GenericProxyConfig
+          import sys, os, re, json, urllib.request, http.cookiejar
 
           video_input = os.environ['VIDEO_URL']
           lang = os.environ.get('LANG_CODE', 'zh-Hans')
@@ -43,42 +42,55 @@ jobs:
           video_id = match.group(1) if match else video_input.strip()
           print(f"Video ID: {video_id}")
 
-          # 读取 cookies
-          cookie_header = {}
-          try:
-              cookies = {}
-              with open('/tmp/cookies.txt') as f:
-                  for line in f:
-                      line = line.strip()
-                      if line and not line.startswith('#'):
-                          parts = line.split('\t')
-                          if len(parts) >= 7:
-                              cookies[parts[5]] = parts[6]
-              cookie_str = '; '.join(f'{k}={v}' for k,v in cookies.items())
-              cookie_header = {'Cookie': cookie_str}
-              print(f"已加载 {len(cookies)} 个 cookies")
-          except Exception as e:
-              print(f"Cookie 加载失败: {e}")
-
+          # 加载 cookies 到 requests session
           import requests
           session = requests.Session()
           session.headers.update({
-              'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15',
-              **cookie_header
+              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+              'Accept-Language': 'zh-CN,zh;q=0.9',
           })
 
+          cj = http.cookiejar.MozillaCookieJar('/tmp/cookies.txt')
+          try:
+              cj.load(ignore_discard=True, ignore_expires=True)
+              print(f"已加载 {len(list(cj))} 个 cookies")
+              session.cookies = requests.cookies.RequestsCookieJar()
+              for c in cj:
+                  session.cookies.set(c.name, c.value, domain=c.domain, path=c.path)
+          except Exception as e:
+              print(f"Cookie 加载: {e}")
+
+          from youtube_transcript_api import YouTubeTranscriptApi
           api = YouTubeTranscriptApi(http_client=session)
+
           fetched = None
           for try_lang in [lang, 'zh-Hans', 'zh', 'en']:
               try:
                   fetched = api.fetch(video_id, languages=[try_lang])
-                  print(f"成功获取语言: {try_lang}")
+                  print(f"成功: {try_lang}")
                   break
               except Exception as e:
-                  print(f"  {try_lang}: {e}")
+                  print(f"  {try_lang}: {str(e)[:100]}")
 
           if not fetched:
-              print("No subtitles found"); sys.exit(1)
+              # 降级：用 yt-dlp 的 --cookies 参数
+              print("youtube-transcript-api 失败，尝试 yt-dlp...")
+              import subprocess, glob
+              result = subprocess.run([
+                  'yt-dlp', '--write-auto-sub', '--write-sub',
+                  '--sub-langs', lang, '--skip-download',
+                  '--cookies', '/tmp/cookies.txt',
+                  '--output', f'output/%(id)s.%(ext)s',
+                  f'https://youtu.be/{video_id}'
+              ], capture_output=True, text=True)
+              print(result.stdout[-500:])
+              print(result.stderr[-500:])
+              # 找下载的字幕文件
+              files = glob.glob(f'output/{video_id}*.vtt') + glob.glob(f'output/{video_id}*.srt')
+              if files:
+                  print(f"yt-dlp 成功: {files}")
+                  sys.exit(0)
+              sys.exit(1)
 
           lines = []
           for s in list(fetched):
@@ -103,8 +115,7 @@ jobs:
           with open(out, 'w') as f:
               f.write(f"# {title}\n\n**频道**：{channel}  \n**链接**：https://youtu.be/{video_id}\n\n---\n\n")
               f.write('\n'.join(lines))
-
-          print(f"✅ Saved {out} ({len(lines)} segs)")
+          print(f"✅ {out} ({len(lines)} segs)")
           EOF
 
       - uses: actions/upload-artifact@v4
