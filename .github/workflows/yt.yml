@@ -1,0 +1,91 @@
+name: yt-transcript
+
+on:
+  workflow_dispatch:
+    inputs:
+      video_url:
+        description: 'YouTube URL or video ID'
+        required: true
+      language:
+        description: 'Subtitle language'
+        required: false
+        default: 'zh-Hans'
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install
+        run: pip install youtube-transcript-api
+
+      - name: Run
+        env:
+          VIDEO_URL: ${{ github.event.inputs.video_url }}
+          LANG_CODE: ${{ github.event.inputs.language }}
+        run: |
+          python3 - << 'EOF'
+          import sys, os, re, json, urllib.request
+          from youtube_transcript_api import YouTubeTranscriptApi
+
+          video_input = os.environ['VIDEO_URL']
+          lang = os.environ.get('LANG_CODE', 'zh-Hans')
+
+          match = re.search(r'(?:v=|youtu\.be/)([A-Za-z0-9_-]{11})', video_input)
+          video_id = match.group(1) if match else video_input.strip()
+          print(f"Video ID: {video_id}")
+
+          api = YouTubeTranscriptApi()
+          fetched = None
+          for try_lang in [lang, 'zh-Hans', 'zh', 'en']:
+              try:
+                  fetched = api.fetch(video_id, languages=[try_lang])
+                  print(f"Lang: {try_lang}")
+                  break
+              except Exception as e:
+                  print(f"  {try_lang}: {e}")
+
+          if not fetched:
+              print("No subtitles found"); sys.exit(1)
+
+          lines = []
+          for s in list(fetched):
+              ms = int(float(s.start) * 1000)
+              ts = f"[{ms//3600000:02d}:{(ms%3600000)//60000:02d}:{(ms%60000)//1000:02d}]"
+              if s.text.strip():
+                  lines.append(f"{ts} {s.text.strip()}")
+
+          title, channel = video_id, ""
+          try:
+              req = urllib.request.Request(
+                  f"https://www.youtube.com/oembed?url=https://youtu.be/{video_id}&format=json",
+                  headers={"User-Agent": "Mozilla/5.0"})
+              with urllib.request.urlopen(req, timeout=10) as r:
+                  meta = json.loads(r.read())
+                  title = meta.get('title', video_id)
+                  channel = meta.get('author_name', '')
+          except: pass
+
+          os.makedirs('output', exist_ok=True)
+          out = f"output/{video_id}.md"
+          with open(out, 'w') as f:
+              f.write(f"# {title}\n\n**频道**：{channel}  \n**链接**：https://youtu.be/{video_id}\n\n---\n\n")
+              f.write('\n'.join(lines))
+
+          print(f"Saved {out} ({len(lines)} segs)")
+          EOF
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: transcript
+          path: output/
+
+      - name: Commit
+        run: |
+          git config user.name "minis-agent"
+          git config user.email "minis@agent.local"
+          git add output/
+          git diff --cached --quiet || git commit -m "transcript: ${{ github.event.inputs.video_url }}" && git push
